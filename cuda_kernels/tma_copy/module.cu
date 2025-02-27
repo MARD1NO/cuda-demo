@@ -47,12 +47,11 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
-    auto smem = reinterpret_cast<float*>(smem_buffer);
     constexpr uint32_t SMEM_COPY_SIZE_PERSTAGE = BLOCK_M * BLOCK_K * sizeof(float);
     constexpr uint32_t SMEM_COPY_SIZE = kNumStages * SMEM_COPY_SIZE_PERSTAGE; 
     constexpr uint32_t kNumTMAMulticast = 1; 
     
-    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem + SMEM_COPY_SIZE);
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_COPY_SIZE);
 
     Barrier* full_barriers[kNumStages];
     Barrier* empty_barriers[kNumStages];
@@ -88,22 +87,28 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
         (kNumTMAMulticast > 1) ? cutlass::arch::fence_barrier_init() : void();
     }
 
+    // Synchronize all threads to make barrier visible in normal memory model
+    (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+
     constexpr uint32_t kFullKOfStages = BLOCK_K * kNumStages; 
     uint32_t num_iterations = cols / kFullKOfStages; 
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
 
 
     if (warp_idx == 0) {
-        // Warp 0 is responsible for copy data to smem. 
-        for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
-            for(int s = 0; s < kNumStages; s++) {
-                // empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
-                empty_barriers[s]->wait((copy_iteration * num_iterations + s + 1) & 1);
-                auto& full_barrier = *full_barriers[s];
-                tma_copy<kNumTMAMulticast>(&tensor_map, reinterpret_cast<uint64_t*>(&full_barrier),
-                                           smem_a[s], copy_iteration * BLOCK_M,
-                                           copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K);
-                full_barrier.arrive_and_expect_tx(SMEM_COPY_SIZE_PERSTAGE);
+        if (threadIdx.x == 0) {
+            // Warp 0 is responsible for copy data to smem. 
+            for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
+                for(int s = 0; s < kNumStages; s++) {
+                    // empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+                    empty_barriers[s]->wait((copy_iteration + 1) & 1);
+                    auto& full_barrier = *full_barriers[s];
+                    tma_copy<kNumTMAMulticast>(&tensor_map, reinterpret_cast<uint64_t*>(&full_barrier),
+                                               smem_a[s], 
+                                               copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, 
+                                               0);
+                    full_barrier.arrive_and_expect_tx(SMEM_COPY_SIZE_PERSTAGE);
+                }
             }
         }
     } else {
@@ -114,16 +119,29 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
         for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
             for(int s = 0; s < kNumStages; s++) {
                 auto& full_barrier = *full_barriers[s];
-                full_barriers[s]->wait((copy_iteration * num_iterations + s + 1) & 1);
+                full_barriers[s]->wait((copy_iteration) & 1);
                 
                 uint32_t y_offset = copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K; 
                 
+                // if (s == 0) {
+                //     if (worker_id == 0) {
+                //         for (int row_idx = 0; row_idx < BLOCK_M; ++row_idx) {
+                //             for (int col_idx = 0; col_idx < BLOCK_K; ++col_idx) {
+                //                 uint32_t idx = row_idx * BLOCK_K + col_idx; 
+                //                 printf("row_idx is: %d, col_idx is: %d, val is: %f\n", row_idx, col_idx, smem_a[s][idx]);
+                //             }
+                //         }
+                //     }
+                // }
                 for(int i = worker_id; i < BLOCK_M * BLOCK_K; i+=32) {
                     uint32_t row_idx = i / BLOCK_K;
-                    uint32_t col_idx = i / BLOCK_K;
+                    uint32_t col_idx = i % BLOCK_K;
                     y[row_idx * cols + col_idx + y_offset] = smem_a[s][i];
                 }; 
-                empty_barriers[s]->arrive(); 
+                cutlass::arch::NamedBarrier(32).sync();
+                if (worker_id == 0) {
+                    empty_barriers[s]->arrive();
+                }
             }
         }
     }
@@ -139,10 +157,11 @@ void run_kernel(const float* x, float* y, int32_t rows, int32_t cols, cudaStream
     size_t smem_barrier_size = kNumStages * sizeof(int64_t) * 2; 
     size_t smem_buf_size = kNumStages * PER_STAGE_COPY_SIZE; 
     size_t smem_size = smem_barrier_size + smem_buf_size; 
+    smem_size = (smem_size + 1024 - 1) / 1024 * 1024; 
 
     cudaFuncSetAttribute(tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); 
 
-    auto tma_a_desc = make_2d_tma_desc(x, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K);
+    auto tma_a_desc = make_2d_tma_desc(x, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
 
     tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages><<<1, 64, smem_size, stream>>>(x, y, rows, cols, tma_a_desc);
 }
