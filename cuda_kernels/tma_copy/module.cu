@@ -7,6 +7,7 @@
 
 
 #include "tma_utils.cuh"
+#include "scheduler.cuh"
 
 
 #include <torch/extension.h>
@@ -97,48 +98,55 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
     uint32_t num_iterations = cols / kFullKOfStages; 
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
 
+    uint32_t m_block_idx;
+    Scheduler<BLOCK_M> scheduler(rows);
 
     if (warp_idx == 0) {
-        if (threadIdx.x == 0) {
-            // Warp 0 is responsible for copy data to smem. 
-            for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
-                for(int s = 0; s < kNumStages; s++) {
-                    // empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
-                    empty_barriers[s]->wait((copy_iteration + 1) & 1);
-                    auto& full_barrier = *full_barriers[s];
-                    tma_copy<kNumTMAMulticast>(&tensor_map, reinterpret_cast<uint64_t*>(&full_barrier),
-                                               smem_a[s], 
-                                               copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, 
-                                               0);
-                    full_barrier.arrive_and_expect_tx(SMEM_COPY_SIZE_PERSTAGE);
+        while(scheduler.get_next_block(m_block_idx)) {
+            if (threadIdx.x == 0) {
+                // Warp 0 is responsible for copy data to smem. 
+                for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
+                    for(int s = 0; s < kNumStages; s++) {
+                        // empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+                        empty_barriers[s]->wait((copy_iteration + 1) & 1);
+                        auto& full_barrier = *full_barriers[s];
+                        tma_copy<kNumTMAMulticast>(&tensor_map, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                   smem_a[s], 
+                                                   copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, 
+                                                   m_block_idx * BLOCK_M);
+                        full_barrier.arrive_and_expect_tx(SMEM_COPY_SIZE_PERSTAGE);
+                    }
                 }
             }
         }
     } else {
         uint32_t worker_id = threadIdx.x % 32;
 
-        // Warp 0 is responsible for copy data to smem. 
-        // wait and arrive
-        for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
-            for(int s = 0; s < kNumStages; s++) {
-                auto& full_barrier = *full_barriers[s];
-                full_barriers[s]->wait((copy_iteration) & 1);
-                
-                uint32_t y_offset = copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K; 
-                
-                // Use TMA store to write back to global memory
-                if (worker_id == 0) {
-                    cute::SM90_TMA_STORE_2D::copy(&tensor_out_map, smem_a[s], copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, 0);
-                    cute::tma_store_arrive();
-                    cute::tma_store_wait<0>();
-                }
-                __syncwarp();
-                
-                if (worker_id == 0) {
-                    empty_barriers[s]->arrive();
+        while(scheduler.get_next_block(m_block_idx)) {
+            // Warp 0 is responsible for copy data to smem. 
+            // wait and arrive
+            for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
+                for(int s = 0; s < kNumStages; s++) {
+                    auto& full_barrier = *full_barriers[s];
+                    full_barriers[s]->wait((copy_iteration) & 1);
+                    
+                    uint32_t y_offset = copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K; 
+                    
+                    // Use TMA store to write back to global memory
+                    if (worker_id == 0) {
+                        cute::SM90_TMA_STORE_2D::copy(&tensor_out_map, smem_a[s], copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, m_block_idx * BLOCK_M);
+                        cute::tma_store_arrive();
+                        cute::tma_store_wait<0>();
+                    }
+                    __syncwarp();
+                    
+                    if (worker_id == 0) {
+                        empty_barriers[s]->arrive();
+                    }
                 }
             }
         }
+        
     }
 }
 
@@ -162,14 +170,14 @@ void run_kernel(const float* x, float* y, int32_t rows, int32_t cols, cudaStream
     auto tma_a_desc = make_2d_tma_desc(x, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K);
     auto tma_out_desc = make_2d_tma_desc(y, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K);
 
-    tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages><<<1, 64, smem_size, stream>>>(x, y, rows, cols, tma_a_desc, tma_out_desc);
+    tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages><<<4, 64, smem_size, stream>>>(x, y, rows, cols, tma_a_desc, tma_out_desc);
 }
 
 
 void tma_copy_func(const torch::Tensor& x, torch::Tensor& y) {
   auto rows = x.size(0);
   auto cols = x.size(1);
-  TORCH_CHECK(rows == 32); 
+  TORCH_CHECK(rows % 32 == 0); 
   TORCH_CHECK(cols % 64 == 0); 
   run_kernel(x.data_ptr<float>(), y.data_ptr<float>(), rows, cols,
              at::cuda::getCurrentCUDAStream()); 
