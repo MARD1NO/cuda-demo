@@ -42,7 +42,8 @@ static CUtensorMap make_2d_tma_desc(
 
 template<int32_t BLOCK_M, int32_t BLOCK_K, int32_t kNumStages>
 __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t cols, 
-                                const __grid_constant__ CUtensorMap tensor_map) {
+                                const __grid_constant__ CUtensorMap tensor_map, 
+                                const __grid_constant__ CUtensorMap tensor_out_map) {
 
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
@@ -64,6 +65,8 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
 
     if (threadIdx.x == 0) {
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map));
+        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_out_map));
+
     }
     __syncwarp();
 
@@ -133,12 +136,21 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
                 //         }
                 //     }
                 // }
-                for(int i = worker_id; i < BLOCK_M * BLOCK_K; i+=32) {
-                    uint32_t row_idx = i / BLOCK_K;
-                    uint32_t col_idx = i % BLOCK_K;
-                    y[row_idx * cols + col_idx + y_offset] = smem_a[s][i];
-                }; 
-                cutlass::arch::NamedBarrier(32).sync();
+                // for(int i = worker_id; i < BLOCK_M * BLOCK_K; i+=32) {
+                //     uint32_t row_idx = i / BLOCK_K;
+                //     uint32_t col_idx = i % BLOCK_K;
+                //     y[row_idx * cols + col_idx + y_offset] = smem_a[s][i];
+                // }; 
+                // cutlass::arch::NamedBarrier(32).sync();
+
+                // Use TMA store to write back to global memory
+                if (worker_id == 0) {
+                    cute::SM90_TMA_STORE_2D::copy(&tensor_out_map, smem_a[s], copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, 0);
+                    cute::tma_store_arrive();
+                    cute::tma_store_wait<0>();
+                }
+                __syncwarp();
+                
                 if (worker_id == 0) {
                     empty_barriers[s]->arrive();
                 }
@@ -162,8 +174,9 @@ void run_kernel(const float* x, float* y, int32_t rows, int32_t cols, cudaStream
     cudaFuncSetAttribute(tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); 
 
     auto tma_a_desc = make_2d_tma_desc(x, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+    auto tma_out_desc = make_2d_tma_desc(y, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
 
-    tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages><<<1, 64, smem_size, stream>>>(x, y, rows, cols, tma_a_desc);
+    tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages><<<1, 64, smem_size, stream>>>(x, y, rows, cols, tma_a_desc, tma_out_desc);
 }
 
 
