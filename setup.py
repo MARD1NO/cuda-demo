@@ -37,7 +37,7 @@ from torch.utils.cpp_extension import (
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CROSSING_BUILD_CUDA = os.environ.get("CROSSING_BUILD_CUDA", "1") == "1"
 DEVELOP_MODE = "develop" in sys.argv
-PACKAGE_NAME = "crossing_cuda_kernels"
+PACKAGE_NAME = "cuda_demo"
 BASE_WHEEL_URL = (
     None
 )
@@ -291,13 +291,60 @@ class NinjaBuildExtension(BuildExtension):
             self.parallel = min(16, max(1, os.cpu_count() // 2))
 
 
+def tma_copy_extension():
+    sources = []
+    libraries = []
+    library_dirs = []
+    extra_link_args = []
+    macros = []
+
+    this_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crossing")
+    include_dirs = [
+        os.path.dirname(os.path.abspath(__file__)),
+        Path(os.path.dirname(os.path.abspath(__file__))) / "3rdparty" / "cutlass" / "include",
+    ]
+
+    sources.extend(glob.glob("cuda_kernels/tma_copy/*.cu"))
+
+    extra_compile_args = {
+        "cxx": ["-O3", "-fpermissive"],
+        "nvcc": append_nvcc_threads(
+            [
+                "-O3",
+                "--use_fast_math",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--extended-lambda",
+                "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
+                "-std=c++17",
+                "--diag-suppress=177,940",
+                "-Wno-deprecated-declarations",
+            ]
+        ),
+    }
+    append_cuda_extra_compile_flag(extra_compile_args)
+
+    return CUDAExtension(
+        "tma_copy_extension",
+        sources=sources,
+        libraries=libraries,
+        include_dirs=include_dirs,
+        library_dirs=library_dirs,
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
+        define_macros=macros,
+    )
+
+
 ext_modules = []
 if not CUDA_HOME and not ROCM_HOME:
     pass
 else:
     if _is_cuda():
         ext_modules = [
-            # weightonly_gemm_extension(),
+            tma_copy_extension(), 
         ]
 
 cmdclass = {"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
@@ -306,9 +353,9 @@ cached_cmdclass = {"bdist_wheel": CachedWheelsCommand}
 setup(
     name=PACKAGE_NAME,
     setup_requires=["psutil"],
-    use_scm_version={
-        "write_to": "crossing_cuda_kernels/version.py",
-    },
+    # use_scm_version={
+    #     "write_to": "crossing_cuda_kernels/version.py",
+    # },
     packages=find_packages(exclude=("build", "csrc")),
     install_requires=["torch",],
     description="",
