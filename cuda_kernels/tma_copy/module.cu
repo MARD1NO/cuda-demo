@@ -48,8 +48,8 @@ __device__ int32_t ceil_div(int32_t a, int32_t b) {
 
 template<int32_t BLOCK_M, int32_t BLOCK_K, int32_t kNumStages>
 __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t cols, 
-                                const __grid_constant__ CUtensorMap tensor_map, 
-                                const __grid_constant__ CUtensorMap tensor_out_map) {
+                                const __grid_constant__ CUtensorMap tensor_src_map, 
+                                const __grid_constant__ CUtensorMap tensor_dst_map) {
 
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
@@ -71,8 +71,8 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
 
     // First prefetch tensor_map_src and tensor_map_out. 
     if (threadIdx.x == 0) {
-        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map));
-        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_out_map));
+        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_src_map));
+        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_dst_map));
 
     }
     __syncwarp();
@@ -140,7 +140,7 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
                     for(int s = 0; s < kNumInnerStages; s++) {
                         empty_barriers[s]->wait((scheduler.current_iter * num_iterations + copy_iteration + 1) & 1);
                         auto& full_barrier = *full_barriers[s];
-                        tma_copy<kNumTMAMulticast>(&tensor_map, reinterpret_cast<uint64_t*>(&full_barrier),
+                        tma_copy<kNumTMAMulticast>(&tensor_src_map, reinterpret_cast<uint64_t*>(&full_barrier),
                                                 smem_a[s], 
                                                 copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, 
                                                 m_block_idx * BLOCK_M);
@@ -170,7 +170,7 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
                     
                     // Use TMA store to write back to global memory
                     if (worker_id == 0) {
-                        cute::SM90_TMA_STORE_2D::copy(&tensor_out_map, smem_a[s], copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, m_block_idx * BLOCK_M);
+                        cute::SM90_TMA_STORE_2D::copy(&tensor_dst_map, smem_a[s], copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, m_block_idx * BLOCK_M);
                         cute::tma_store_arrive();
                         cute::tma_store_wait<0>();
                     }
@@ -208,13 +208,10 @@ void run_kernel(const float* x, float* y, int32_t rows, int32_t cols, cudaStream
 
     cudaFuncSetAttribute(tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); 
 
-    // auto tma_a_desc = make_2d_tma_desc(x, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-    // auto tma_out_desc = make_2d_tma_desc(y, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+    auto tma_src_desc = make_2d_tma_desc(x, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K);
+    auto tma_dst_desc = make_2d_tma_desc(y, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K);
 
-    auto tma_a_desc = make_2d_tma_desc(x, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K);
-    auto tma_out_desc = make_2d_tma_desc(y, Layout::RowMajor, rows, cols, BLOCK_M, BLOCK_K);
-
-    tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages><<<4, 64, smem_size, stream>>>(x, y, rows, cols, tma_a_desc, tma_out_desc);
+    tma_copy_kernel<BLOCK_M, BLOCK_K, kNumStages><<<4, 64, smem_size, stream>>>(x, y, rows, cols, tma_src_desc, tma_dst_desc);
 }
 
 
@@ -229,15 +226,10 @@ void tma_copy_func(const torch::Tensor& x, torch::Tensor& y) {
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//   m.def(
-//     "tma_copy",
-//     &tma_copy,
-//     "tma copy demo");
-
-m.def(
-    "tma_copy",
-    &tma_copy_func,
-    "cublas fp16 bf16 fp32 gemm");
+    m.def(
+        "tma_copy",
+        &tma_copy_func,
+        "cublas fp16 bf16 fp32 gemm");
 }
 
 
