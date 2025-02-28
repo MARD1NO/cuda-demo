@@ -69,6 +69,7 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
         smem_a[i] = reinterpret_cast<float*>(smem_buffer + i * SMEM_COPY_SIZE_PERSTAGE);
     }
 
+    // First prefetch tensor_map_src and tensor_map_out. 
     if (threadIdx.x == 0) {
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map));
         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_out_map));
@@ -76,19 +77,20 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
     }
     __syncwarp();
 
+    // Barrier is stored in shared memory 
     #pragma unroll 
     for (int i = 0; i < kNumStages; ++ i) {
         full_barriers[i] = barrier_start_ptr + i;
         empty_barriers[i] = barrier_start_ptr + kNumStages + i;
     }
 
+    // Barrier are initialized by 1. 
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int i = 0; i < kNumStages; ++ i) {
             full_barriers[i]->init(1);
             // empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
-            empty_barriers[i]->init(kNumTMAMulticast * 32 / 32);
-
+            empty_barriers[i]->init(1);
         }
 
         // Make initialized barrier visible in async proxy
@@ -99,14 +101,17 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
     // Synchronize all threads to make barrier visible in normal memory model
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
 
+    // Total Stages copy kFullKOfStages data. 
     constexpr uint32_t kFullKOfStages = BLOCK_K * kNumStages; 
     uint32_t num_iterations = ceil_div(cols, kFullKOfStages);
     
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
 
     uint32_t m_block_idx;
+    // The Block Scheduler is used for persistent schedule. it means a Block may responsible for multiple work. 
     Scheduler<BLOCK_M> scheduler(rows);
 
+    // A tag means current iter is divisible by K, or not divisible. 
     struct DivisibleK{}; 
     struct NotDivisibleK{}; 
 
@@ -119,6 +124,7 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
             for(int copy_iteration = 0; copy_iteration < num_iterations - 1; copy_iteration++) {
                 func(copy_iteration, DivisibleK{}); 
             }
+            // Seperate a single iter. 
             func(num_iterations - 1, NotDivisibleK{}); 
         }
     }; 
@@ -129,10 +135,8 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
                 // Warp 0 is responsible for copy data to smem. 
                 launch_k_iterations([&](int copy_iteration, auto type) {
                     constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                    // If not divisible, num inner stage only iterate actual K, the remain stage only update/wait barrier. 
                     const int kNumInnerStages = kHasDivisibleStages ? kNumStages : (cols % kFullKOfStages) / BLOCK_K;
-                    // printf("cols is: %d, kFullKOfStages is: %d, cols % kFullKOfStages %d. \n", cols, kFullKOfStages, cols % kFullKOfStages); 
-                    // printf("kNumInnerStages is: %d, kNumStages is: %d. \n", kNumInnerStages, kNumStages); 
-                    // printf("num_iterations is: %d. \n", num_iterations);
                     for(int s = 0; s < kNumInnerStages; s++) {
                         empty_barriers[s]->wait((scheduler.current_iter * num_iterations + copy_iteration + 1) & 1);
                         auto& full_barrier = *full_barriers[s];
@@ -185,7 +189,6 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
                     }
                 }
                 __syncwarp();
-
             }); 
         }
     }
