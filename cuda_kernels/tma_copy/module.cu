@@ -41,6 +41,197 @@ static CUtensorMap make_2d_tma_desc(
 }
 
 
+__device__ int32_t ceil_div(int32_t a, int32_t b) {
+    return (a + b - 1) / b; 
+}
+
+
+// template<int32_t BLOCK_M, int32_t BLOCK_K, int32_t kNumStages>
+// __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t cols, 
+//                                 const __grid_constant__ CUtensorMap tensor_map, 
+//                                 const __grid_constant__ CUtensorMap tensor_out_map) {
+
+//     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+//     extern __shared__ __align__(1024) uint8_t smem_buffer[];
+
+//     constexpr uint32_t SMEM_COPY_SIZE_PERSTAGE = BLOCK_M * BLOCK_K * sizeof(float);
+//     constexpr uint32_t SMEM_COPY_SIZE = kNumStages * SMEM_COPY_SIZE_PERSTAGE; 
+//     constexpr uint32_t kNumTMAMulticast = 1; 
+    
+//     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_COPY_SIZE);
+
+//     Barrier* full_barriers[kNumStages];
+//     Barrier* empty_barriers[kNumStages];
+
+//     float* smem_a[kNumStages]; 
+//     #pragma unroll
+//     for (int i = 0; i < kNumStages; ++ i) {
+//         smem_a[i] = reinterpret_cast<float*>(smem_buffer + i * SMEM_COPY_SIZE_PERSTAGE);
+//     }
+
+//     if (threadIdx.x == 0) {
+//         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map));
+//         cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_out_map));
+
+//     }
+//     __syncwarp();
+
+//     #pragma unroll 
+//     for (int i = 0; i < kNumStages; ++ i) {
+//         full_barriers[i] = barrier_start_ptr + i;
+//         empty_barriers[i] = barrier_start_ptr + kNumStages + i;
+//     }
+
+//     if (threadIdx.x == 0) {
+//         #pragma unroll
+//         for (int i = 0; i < kNumStages; ++ i) {
+//             full_barriers[i]->init(1);
+//             // empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
+//             empty_barriers[i]->init(kNumTMAMulticast * 32 / 32);
+
+//         }
+
+//         // Make initialized barrier visible in async proxy
+//         cutlass::arch::fence_view_async_shared();
+//         (kNumTMAMulticast > 1) ? cutlass::arch::fence_barrier_init() : void();
+//     }
+
+//     // Synchronize all threads to make barrier visible in normal memory model
+//     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+
+//     constexpr uint32_t kFullKOfStages = BLOCK_K * kNumStages; 
+//     // uint32_t num_iterations = cols / kFullKOfStages; 
+//     uint32_t num_iterations = ceil_div(cols, kFullKOfStages);
+    
+//     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+
+//     uint32_t m_block_idx;
+//     Scheduler<BLOCK_M> scheduler(rows);
+
+//     struct DivisibleK{}; 
+//     struct NotDivisibleK{}; 
+
+//     auto launch_k_iterations = [num_iterations, cols](const auto& func) {
+//         if (cols % kFullKOfStages == 0) {
+//             for(int copy_iteration = 0; copy_iteration < num_iterations; copy_iteration++) {
+//                 func(copy_iteration, DivisibleK{}); 
+//             }
+//         } else {
+//             for(int copy_iteration = 0; copy_iteration < num_iterations - 1; copy_iteration++) {
+//                 func(copy_iteration, DivisibleK{}); 
+//             }
+//             func(num_iterations - 1, NotDivisibleK{}); 
+//         }
+//     }; 
+
+//     if (warp_idx == 0) {
+//         while(scheduler.get_next_block(m_block_idx)) {
+//             if (threadIdx.x == 0) {
+//                 // // Warp 0 is responsible for copy data to smem. 
+//                 // for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
+//                 //     for(int s = 0; s < kNumStages; s++) {
+//                 //         // empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+//                 //         empty_barriers[s]->wait((copy_iteration + 1) & 1);
+//                 //         auto& full_barrier = *full_barriers[s];
+//                 //         tma_copy<kNumTMAMulticast>(&tensor_map, reinterpret_cast<uint64_t*>(&full_barrier),
+//                 //                                    smem_a[s], 
+//                 //                                    copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, 
+//                 //                                    m_block_idx * BLOCK_M);
+//                 //         full_barrier.arrive_and_expect_tx(SMEM_COPY_SIZE_PERSTAGE);
+//                 //     }
+//                 // }
+                
+
+//                 launch_k_iterations([&](int copy_iteration, auto type) {
+//                     constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+//                     const int kNumInnerStages = kHasDivisibleStages ? kNumStages : (cols % kFullKOfStages) / BLOCK_K;
+//                     // printf("cols is: %d, kFullKOfStages is: %d, cols % kFullKOfStages %d. \n", cols, kFullKOfStages, cols % kFullKOfStages); 
+//                     // printf("kNumInnerStages is: %d, kNumStages is: %d. \n", kNumInnerStages, kNumStages); 
+//                     // printf("num_iterations is: %d. \n", num_iterations);
+//                     for(int s = 0; s < kNumInnerStages; s++) {
+//                         // empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+//                         empty_barriers[s]->wait((copy_iteration + 1) & 1);
+//                         auto& full_barrier = *full_barriers[s];
+//                         tma_copy<kNumTMAMulticast>(&tensor_map, reinterpret_cast<uint64_t*>(&full_barrier),
+//                                                 smem_a[s], 
+//                                                 copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, 
+//                                                 m_block_idx * BLOCK_M);
+//                         full_barrier.arrive_and_expect_tx(SMEM_COPY_SIZE_PERSTAGE);
+//                     }
+                    
+//                     // // Wait unaligned cases
+//                     // for(int s = kNumInnerStages; s < kNumStages; s++) {
+//                     //     empty_barriers[s]->wait((copy_iteration + 1) & 1);
+//                     //     full_barriers[s]->arrive();
+//                     // }
+//                 }); 
+//             }
+//         }
+//     } else {
+//         uint32_t worker_id = threadIdx.x % 32;
+
+//         while(scheduler.get_next_block(m_block_idx)) {
+//             // Warp 0 is responsible for copy data to smem. 
+//             // wait and arrive
+            
+//             // for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
+//             //     for(int s = 0; s < kNumStages; s++) {
+//             //         auto& full_barrier = *full_barriers[s];
+//             //         full_barriers[s]->wait((copy_iteration) & 1);
+                    
+//             //         uint32_t y_offset = copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K; 
+                    
+//             //         // Use TMA store to write back to global memory
+//             //         if (worker_id == 0) {
+//             //             cute::SM90_TMA_STORE_2D::copy(&tensor_out_map, smem_a[s], copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, m_block_idx * BLOCK_M);
+//             //             cute::tma_store_arrive();
+//             //             cute::tma_store_wait<0>();
+//             //         }
+//             //         __syncwarp();
+                    
+//             //         if (worker_id == 0) {
+//             //             empty_barriers[s]->arrive();
+//             //         }
+//             //     }
+//             // }
+
+
+//             launch_k_iterations([&](int copy_iteration, auto type) {
+//                 constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+//                 const int kNumInnerStages = kHasDivisibleStages ? kNumStages : (cols % kFullKOfStages) / BLOCK_K;
+
+//                 for(int s = 0; s < kNumInnerStages; s++) {
+//                     auto& full_barrier = *full_barriers[s];
+//                     full_barriers[s]->wait((copy_iteration) & 1);
+                    
+//                     // Use TMA store to write back to global memory
+//                     if (worker_id == 0) {
+//                         cute::SM90_TMA_STORE_2D::copy(&tensor_out_map, smem_a[s], copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K, m_block_idx * BLOCK_M);
+//                         cute::tma_store_arrive();
+//                         cute::tma_store_wait<0>();
+//                     }
+//                     __syncwarp();
+                    
+//                     if (worker_id == 0) {
+//                         empty_barriers[s]->arrive();
+//                     }
+//                 }
+
+//                 // // Wait unaligned cases
+//                 // for(int s = kNumInnerStages; s < kNumStages; s++) {
+//                 //     full_barriers[s]->wait((copy_iteration) & 1);
+//                 //     if (worker_id == 0) {
+//                 //         empty_barriers[s]->arrive();
+//                 //     }
+//                 // }
+//                 // __syncwarp();
+
+//             }); 
+//         }
+//     }
+// }
+
+
 template<int32_t BLOCK_M, int32_t BLOCK_K, int32_t kNumStages>
 __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t cols, 
                                 const __grid_constant__ CUtensorMap tensor_map, 
@@ -108,7 +299,7 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
                 for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
                     for(int s = 0; s < kNumStages; s++) {
                         // empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
-                        empty_barriers[s]->wait((copy_iteration + 1) & 1);
+                        empty_barriers[s]->wait((scheduler.current_iter * num_iterations + copy_iteration + 1) & 1);
                         auto& full_barrier = *full_barriers[s];
                         tma_copy<kNumTMAMulticast>(&tensor_map, reinterpret_cast<uint64_t*>(&full_barrier),
                                                    smem_a[s], 
@@ -128,7 +319,7 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
             for(int copy_iteration = 0; copy_iteration < num_iterations; ++copy_iteration) {
                 for(int s = 0; s < kNumStages; s++) {
                     auto& full_barrier = *full_barriers[s];
-                    full_barriers[s]->wait((copy_iteration) & 1);
+                    full_barriers[s]->wait((scheduler.current_iter * num_iterations + copy_iteration) & 1);
                     
                     uint32_t y_offset = copy_iteration * kNumStages * BLOCK_K + s * BLOCK_K; 
                     
@@ -149,6 +340,7 @@ __global__ void tma_copy_kernel(const float* x, float* y, int32_t rows, int32_t 
         
     }
 }
+
 
 
 void run_kernel(const float* x, float* y, int32_t rows, int32_t cols, cudaStream_t stream) {
